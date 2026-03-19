@@ -104,14 +104,24 @@ In Pi:
 
 - `/speak` — toggle speak mode ON/OFF
 
-Voice flow with listener:
+### End-to-end workflow (including Superwhisper)
 
-- Say **Winston** to start recording
-- Say **Winston** again to stop and hand off to Superwhisper
-- Say **Nevermind** while recording to cancel
-- Transcribed text is injected into the active Pi session via the injector socket
+1. Enable speak mode with `/speak`.
+2. Pi starts:
+   - the TTS daemon (`extensions/qwen3_tts_daemon.py`)
+   - the Winston listener (`swift run --package-path listener`)
+3. You say **Winston**.
+4. Listener begins recording (with start cue + output ducking).
+5. You speak your prompt.
+6. You say **Winston** again to stop (or **Nevermind** to cancel).
+7. On stop, listener sends the captured `.wav` to **Superwhisper**.
+8. Superwhisper transcribes audio and writes text to clipboard.
+9. Listener reads that transcript and injects it into your active Pi session through `pi-session-injector.ts` (`<os-tmpdir>/pi-session-inject.sock`).
+10. Pi receives that as your user message and starts responding.
+11. While Pi responds, `speak-mode.ts` streams spoken output sentence-by-sentence.
+12. If you start a new request, current speech is interrupted and Pi acknowledges with: `"Message received. Working..."`.
 
-For listener details, see: `listener/README.md`
+For listener-level details (focus handling, clipboard restore, capture cleanup), see: `listener/README.md`.
 
 ---
 
