@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+extensions/__pycache__/
+
+listener/.build/
+listener/captures/*.wav
+listener/captures/*.txt
+listener/captures/*.json
+!listener/captures/.gitkeep

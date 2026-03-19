@@ -1,0 +1,5 @@
+torch
+numpy
+sounddevice
+soundfile
+mlx-audio==0.4.1
