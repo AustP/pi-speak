@@ -6,15 +6,18 @@ import os from "node:os";
 import path from "node:path";
 
 const DAEMON_FILENAME = "qwen3_tts_daemon.py";
-const DAEMON_READY_TIMEOUT_MS = 120000;
+const DAEMON_READY_TIMEOUT_MS = 180000;
 const STATUS_KEY = "speak-mode";
 const MAX_SPOKEN_TEXT_LENGTH = 260;
-const STILL_WORKING_INTERVAL_MS = 7000;
+const STILL_WORKING_INTERVAL_MS = 17000;
 const EXTENSION_DIR = __dirname;
 const PROJECT_ROOT = path.resolve(EXTENSION_DIR, "..");
 const PYTHON_EXECUTABLE = path.join(PROJECT_ROOT, ".venv/bin/python");
 const LISTENER_PACKAGE_PATH = path.join(PROJECT_ROOT, "listener");
 const TTS_CONTROL_SOCKET_PATH = path.join(os.tmpdir(), "pi-tts-control.sock");
+const GLIMPSE_MODULE_PATH = "/Users/aust/src/glimpse/src/glimpse.mjs";
+const FULL_OUTPUT_TRIGGER_PATTERN = /\bfull output\b/i;
+const WINSTON_TRIGGER_PATTERN = /\bwinston\b/i;
 
 type UIContext = {
 	ui: {
@@ -31,22 +34,13 @@ export default function (pi: ExtensionAPI) {
 	let daemonReady = false;
 	let startupPromise: Promise<void> | null = null;
 	let listenerStartupPromise: Promise<void> | null = null;
-	let pendingSpeech: string[] = [];
-	let streamingTextBuffer = "";
-	let sawStreamingTextDelta = false;
+	let pendingPayloads: string[] = [];
+	let lastAssistantOutput = "";
 	let acknowledgedUserMessageInTurn = false;
 	let stillWorkingInterval: NodeJS.Timeout | null = null;
 
 	const setStatus = (ctx: UIContext, state: "off" | "loading" | "on") => {
-		if (state === "loading") {
-			ctx.ui.setStatus(STATUS_KEY, "🔊 Speak: Loading");
-			return;
-		}
-		if (state === "on") {
-			ctx.ui.setStatus(STATUS_KEY, "🔊 Speak: ON");
-			return;
-		}
-		ctx.ui.setStatus(STATUS_KEY, "🔇 Speak: OFF");
+		ctx.ui.setStatus(STATUS_KEY, state === "loading" ? "🔊 Speak: Loading" : state === "on" ? "🔊 Speak: ON" : "🔇 Speak: OFF");
 	};
 
 	const normalize = (text: string): string => {
@@ -57,34 +51,76 @@ export default function (pi: ExtensionAPI) {
 		return `${withoutEmoji.slice(0, MAX_SPOKEN_TEXT_LENGTH - 1)}…`;
 	};
 
-	const errorLikePattern = /\b(error|exception|fatal|panic|traceback|failed?)\b/i;
-
 	const notifyStderrErrorsOnly = (ctx: UIContext, prefix: string, chunk: string) => {
 		const output = normalize(chunk);
 		if (!output) return;
-		if (!errorLikePattern.test(output)) return;
+		if (!/\b(error|exception|fatal|panic|traceback|failed?)\b/i.test(output)) return;
 		ctx.ui.notify(`${prefix}: ${output}`, "error");
 	};
 
-	const enqueueSpeech = (text: string) => {
-		if (!enabled) return;
-		const line = normalize(text);
-		if (!line) return;
+	const showFullOutputInGlimpse = (text: string, ctx: UIContext) => {
+		const script = `
+import { prompt } from ${JSON.stringify(GLIMPSE_MODULE_PATH)};
 
+let text = "";
+process.stdin.setEncoding("utf8");
+for await (const chunk of process.stdin) {
+	text += chunk;
+}
+
+const escapeHtml = (value) => value
+	.replace(/&/g, "&amp;")
+	.replace(/</g, "&lt;")
+	.replace(/>/g, "&gt;")
+	.replace(/\"/g, "&quot;")
+	.replace(/'/g, "&#39;");
+
+const escaped = escapeHtml(text);
+const html = \`<body style="margin:0;background:#111;color:#e5e7eb;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">
+	<div style="padding:14px 16px;border-bottom:1px solid #2f2f2f;font-family:system-ui, -apple-system, sans-serif;font-size:13px;color:#a3a3a3;">Last full assistant output</div>
+	<pre style="margin:0;padding:16px;white-space:pre-wrap;word-break:break-word;line-height:1.45;font-size:13px;">\${escaped}</pre>
+</body>\`;
+
+await prompt(html, { width: 980, height: 720, title: "Full Output" });
+`;
+
+		const child = spawn("node", ["--input-type=module", "-e", script], {
+			cwd: PROJECT_ROOT,
+			stdio: ["pipe", "ignore", "ignore"],
+			detached: true,
+		});
+		child.stdin.write(text);
+		child.stdin.end();
+		child.unref();
+		ctx.ui.notify("Opened full output in Glimpse.", "info");
+	};
+
+	const enqueuePayload = (payload: { type: "speak" | "summarize_speak"; text: string }) => {
+		if (!enabled) return;
+		const serialized = JSON.stringify(payload);
 		if (!daemon || !daemonReady) {
-			pendingSpeech.push(line);
+			pendingPayloads.push(serialized);
 			return;
 		}
+		daemon.stdin.write(`${serialized}\n`);
+	};
 
-		daemon.stdin.write(`${JSON.stringify({ type: "speak", text: line })}\n`);
+	const enqueueSpeech = (text: string) => {
+		const line = normalize(text);
+		if (!line) return;
+		enqueuePayload({ type: "speak", text: line });
+	};
+
+	const enqueueSummarizedSpeech = (text: string) => {
+		const cleaned = text.replace(/[\p{Extended_Pictographic}\uFE0F]/gu, "").replace(/\s+/g, " ").trim();
+		if (!cleaned) return;
+		enqueuePayload({ type: "summarize_speak", text: cleaned });
 	};
 
 	const flushPending = () => {
 		if (!daemon || !daemonReady) return;
-		for (const text of pendingSpeech) {
-			daemon.stdin.write(`${JSON.stringify({ type: "speak", text })}\n`);
-		}
-		pendingSpeech = [];
+		for (const payload of pendingPayloads) daemon.stdin.write(`${payload}\n`);
+		pendingPayloads = [];
 	};
 
 	const stopStillWorkingAnnouncements = () => {
@@ -94,40 +130,31 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const startStillWorkingAnnouncements = () => {
-		if (!enabled) return;
-		if (stillWorkingInterval) return;
+		if (!enabled || stillWorkingInterval) return;
 		stillWorkingInterval = setInterval(() => {
-			if (!enabled) {
-				stopStillWorkingAnnouncements();
-				return;
-			}
+			if (!enabled) return stopStillWorkingAnnouncements();
 			enqueueSpeech("Still working...");
 		}, STILL_WORKING_INTERVAL_MS);
 	};
 
 	const interruptPlayback = () => {
-		pendingSpeech = [];
+		pendingPayloads = [];
 		if (!daemon || !daemonReady) return;
 		try {
 			daemon.stdin.write(`${JSON.stringify({ type: "interrupt" })}\n`);
-		} catch {
-			// Ignore interruption stream errors.
-		}
+		} catch {}
 	};
 
 	const cleanupTtsControlSocket = () => {
 		if (!fs.existsSync(TTS_CONTROL_SOCKET_PATH)) return;
 		try {
 			fs.unlinkSync(TTS_CONTROL_SOCKET_PATH);
-		} catch {
-			// Ignore cleanup errors.
-		}
+		} catch {}
 	};
 
 	const startTtsControlServer = (ctx: UIContext) => {
 		if (ttsControlServer) return;
 		cleanupTtsControlSocket();
-
 		const server = net.createServer((socket) => {
 			socket.setEncoding("utf8");
 			let buffer = "";
@@ -144,9 +171,7 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		server.on("error", (error: NodeJS.ErrnoException) => {
-			if (ttsControlServer === server) {
-				ttsControlServer = null;
-			}
+			if (ttsControlServer === server) ttsControlServer = null;
 			cleanupTtsControlSocket();
 			ctx.ui.notify(`TTS control socket error (${TTS_CONTROL_SOCKET_PATH}): ${error.message}`, "error");
 		});
@@ -168,17 +193,12 @@ export default function (pi: ExtensionAPI) {
 		stopStillWorkingAnnouncements();
 		daemonReady = false;
 		startupPromise = null;
-		pendingSpeech = [];
-
+		pendingPayloads = [];
 		if (!daemon) return;
-
 		try {
 			daemon.stdin.write(`${JSON.stringify({ type: "shutdown" })}\n`);
 			daemon.stdin.end();
-		} catch {
-			// Ignore shutdown stream errors.
-		}
-
+		} catch {}
 		daemon.kill("SIGTERM");
 		daemon = null;
 		ctx?.ui.notify("Speak mode model unloaded.", "info");
@@ -187,17 +207,11 @@ export default function (pi: ExtensionAPI) {
 	const startListener = async (ctx: UIContext) => {
 		if (listener) return;
 		if (listenerStartupPromise) return listenerStartupPromise;
-		if (!fs.existsSync(LISTENER_PACKAGE_PATH)) {
-			throw new Error(`Missing listener package at ${LISTENER_PACKAGE_PATH}.`);
-		}
+		if (!fs.existsSync(LISTENER_PACKAGE_PATH)) throw new Error(`Missing listener package at ${LISTENER_PACKAGE_PATH}.`);
 
 		listenerStartupPromise = new Promise<void>((resolve, reject) => {
-			const child = spawn("swift", ["run", "--package-path", LISTENER_PACKAGE_PATH], {
-				cwd: PROJECT_ROOT,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+			const child = spawn("swift", ["run", "--package-path", LISTENER_PACKAGE_PATH], { cwd: PROJECT_ROOT, stdio: ["ignore", "pipe", "pipe"] });
 			listener = child;
-
 			let settled = false;
 			const settleSuccess = () => {
 				if (settled) return;
@@ -212,33 +226,19 @@ export default function (pi: ExtensionAPI) {
 				reject(error);
 			};
 
-			const startupTimer = setTimeout(() => {
-				settleSuccess();
-			}, 1500);
-
+			const startupTimer = setTimeout(settleSuccess, 1500);
 			child.stderr.setEncoding("utf8");
-			child.stderr.on("data", (chunk: string) => {
-				notifyStderrErrorsOnly(ctx, "Listener", chunk);
-			});
-
+			child.stderr.on("data", (chunk: string) => notifyStderrErrorsOnly(ctx, "Listener", chunk));
 			child.on("exit", (code, signal) => {
 				clearTimeout(startupTimer);
 				listener = null;
-				if (!settled) {
-					settleError(new Error(`Listener stopped during startup (${code ?? signal ?? "unknown"}).`));
-					return;
-				}
-				if (!enabled) return;
-				ctx.ui.notify(`Listener stopped (${code ?? signal ?? "unknown"}).`, "error");
+				if (!settled) return settleError(new Error(`Listener stopped during startup (${code ?? signal ?? "unknown"}).`));
+				if (enabled) ctx.ui.notify(`Listener stopped (${code ?? signal ?? "unknown"}).`, "error");
 			});
-
 			child.on("error", (error) => {
 				clearTimeout(startupTimer);
 				listener = null;
-				if (!settled) {
-					settleError(error);
-					return;
-				}
+				if (!settled) return settleError(error);
 				ctx.ui.notify(`Listener error: ${error.message}`, "error");
 			});
 		});
@@ -261,17 +261,9 @@ export default function (pi: ExtensionAPI) {
 		startupPromise = new Promise<void>((resolve, reject) => {
 			const daemonScript = path.join(EXTENSION_DIR, DAEMON_FILENAME);
 			let startupStderr = "";
+			if (!fs.existsSync(PYTHON_EXECUTABLE)) return reject(new Error(`Missing virtualenv python at ${PYTHON_EXECUTABLE}. Run ./setup_venv.sh first.`));
 
-			if (!fs.existsSync(PYTHON_EXECUTABLE)) {
-				startupPromise = null;
-				reject(new Error(`Missing virtualenv python at ${PYTHON_EXECUTABLE}. Run ./setup_venv.sh first.`));
-				return;
-			}
-
-			const child = spawn(PYTHON_EXECUTABLE, [daemonScript], {
-				cwd: PROJECT_ROOT,
-				stdio: ["pipe", "pipe", "pipe"],
-			});
+			const child = spawn(PYTHON_EXECUTABLE, [daemonScript], { cwd: PROJECT_ROOT, stdio: ["pipe", "pipe", "pipe"] });
 			daemon = child;
 
 			const timeout = setTimeout(() => {
@@ -279,7 +271,7 @@ export default function (pi: ExtensionAPI) {
 				daemonReady = false;
 				child.kill("SIGTERM");
 				const err = normalize(startupStderr);
-				reject(new Error(err ? `Timed out waiting for TTS model to load: ${err}` : "Timed out waiting for TTS model to load."));
+				reject(new Error(err ? `Timed out waiting for TTS+summarizer models to load: ${err}` : "Timed out waiting for TTS+summarizer models to load."));
 			}, DAEMON_READY_TIMEOUT_MS);
 
 			child.stdout.setEncoding("utf8");
@@ -325,154 +317,63 @@ export default function (pi: ExtensionAPI) {
 		return startupPromise;
 	};
 
-	const spokenPath = (value: string): string => {
-		return value
-			.replace(/^\.?\//, "")
-			.replace(/[\\/]+/g, " slash ")
-			.replace(/\./g, " dot ")
-			.replace(/[-_]+/g, " ")
-			.replace(/\s+/g, " ")
-			.trim();
-	};
+	const spokenPath = (value: string): string => value.replace(/^\.?\//, "").replace(/[\\/]+/g, " slash ").replace(/\./g, " dot ").replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
 
 	const spokenFriendlyText = (text: string): string => {
 		const withoutLinks = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");
 		const withoutHeadingHashes = withoutLinks.replace(/^\s{0,3}#{1,6}\s+/gm, "");
 		const withoutMarkdown = withoutHeadingHashes.replace(/\*\*(.*?)\*\*/g, "$1").replace(/`([^`]+)`/g, "$1");
-		const pathFriendly = withoutMarkdown.replace(/(^|\s)([.~]?[A-Za-z0-9_./-]*\/[A-Za-z0-9_./-]+)(?=\s|$)/g, (_match, prefix, pathValue) => {
+		const pathFriendly = withoutMarkdown.replace(/(^|\s)([.~]?[A-Za-z0-9_./-]*\/[A-Za-z0-9_./-]+)(?=\s|$)/g, (_m, prefix, pathValue) => {
 			if (typeof pathValue !== "string" || !pathValue.includes("/")) return `${prefix}${pathValue}`;
 			return `${prefix}${spokenPath(pathValue)}`;
 		});
-		const streamTermsFriendly = pathFriendly
+		return pathFriendly
 			.replace(/\bstderr\b/gi, "STD err")
 			.replace(/\bstdout\b/gi, "STD out")
-			.replace(/\bstdin\b/gi, "STD in");
-		const slashFriendly = streamTermsFriendly.replace(/\//g, " slash ");
-		const decimalFriendly = slashFriendly.replace(/\b\d+(?:\.\d+)+\b/g, (match) => match.replace(/\./g, " point "));
-
-		return decimalFriendly
+			.replace(/\bstdin\b/gi, "STD in")
+			.replace(/\bwinston\b/gi, "He Who Must Not Be Named")
 			.split(/\r?\n/)
 			.map((line) => line.replace(/[ \t]+/g, " ").trim())
 			.join("\n")
 			.trim();
 	};
 
-	const messageTextSegments = (message: any): string[] => {
+	const rawMessageTextSegments = (message: any): string[] => {
 		if (!message || message.role !== "assistant") return [];
 		const content = Array.isArray(message.content) ? message.content : [];
 		const segments: string[] = [];
-
 		for (const item of content) {
-			if (item?.type === "text" && typeof item.text === "string") {
-				const text = spokenFriendlyText(item.text);
-				if (text) segments.push(text);
-			}
+			if (item?.type !== "text" || typeof item.text !== "string") continue;
+			const raw = item.text.trim();
+			if (raw) segments.push(raw);
 		}
-
 		return segments;
 	};
 
-	const allSpokenChunks = (text: string): string[] => {
-		const DOT_PLACEHOLDER = "∯";
-		const abbreviations = [
-			"e.g.",
-			"i.e.",
-			"etc.",
-			"vs.",
-			"mr.",
-			"mrs.",
-			"ms.",
-			"dr.",
-			"prof.",
-			"sr.",
-			"jr.",
-			"u.s.",
-			"u.k.",
-		];
-
-		const splitLineIntoSentences = (line: string): string[] => {
-			let normalizedLine = line.replace(/\s+/g, " ").trim();
-			if (!normalizedLine) return [];
-			normalizedLine = normalizedLine.replace(/^\-\s*/, "");
-
-			const escaped = abbreviations.reduce((acc, abbreviation) => {
-				const escapedAbbreviation = abbreviation.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-				const pattern = new RegExp(`\\b${escapedAbbreviation}`, "gi");
-				return acc.replace(pattern, (match) => match.replace(/\./g, DOT_PLACEHOLDER));
-			}, normalizedLine);
-
-			const sentences = escaped
-				.match(/[^.!?]+[.!?]+(?:["')\]]+)?|[^.!?]+$/g)
-				?.map((part) => part.replace(new RegExp(DOT_PLACEHOLDER, "g"), ".").trim())
-				.filter((part) => part.length > 0);
-
-			return sentences && sentences.length > 0 ? sentences : [normalizedLine];
-		};
-
-		return text
-			.split(/\r?\n/)
-			.flatMap((line) => splitLineIntoSentences(line))
-			.map((chunk) => chunk.trim())
-			.filter((chunk) => chunk.length > 0);
+	const messageTextSegments = (message: any): string[] => {
+		const segments = rawMessageTextSegments(message);
+		return segments.map((segment) => spokenFriendlyText(segment)).filter((segment) => segment.length > 0);
 	};
 
-	const extractCompleteSentences = (text: string): { complete: string[]; remainder: string } => {
-		const DOT_PLACEHOLDER = "∯";
-		const PATH_DOT_PLACEHOLDER = "∷";
-		const abbreviations = ["e.g.", "i.e.", "etc.", "vs.", "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "u.s.", "u.k."];
+	const latestAssistantOutputFromSession = (ctx: any): string => {
+		const entries = ctx?.sessionManager?.getEntries?.();
+		if (!Array.isArray(entries)) return "";
 
-		const abbreviationsEscaped = abbreviations.reduce((acc, abbreviation) => {
-			const escapedAbbreviation = abbreviation.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-			const pattern = new RegExp(`\\b${escapedAbbreviation}`, "gi");
-			return acc.replace(pattern, (match) => match.replace(/\./g, DOT_PLACEHOLDER));
-		}, text);
-
-		const pathsEscaped = abbreviationsEscaped.replace(/(^|\s)([.~]?[A-Za-z0-9_./-]*\/[A-Za-z0-9_./-]+)(?=\s|$)/g, (match, prefix, pathValue) => {
-			if (typeof pathValue !== "string") return match;
-			return `${prefix}${pathValue.replace(/\./g, PATH_DOT_PLACEHOLDER)}`;
-		});
-
-		const restorePlaceholders = (value: string) => value
-			.replace(new RegExp(DOT_PLACEHOLDER, "g"), ".")
-			.replace(new RegExp(PATH_DOT_PLACEHOLDER, "g"), ".");
-
-		const sentencePattern = /[^.!?]+[.!?]+(?:["')\]]+)?/g;
-		const complete: string[] = [];
-		let lastConsumed = 0;
-		let match: RegExpExecArray | null = null;
-		while ((match = sentencePattern.exec(pathsEscaped)) !== null) {
-			const value = restorePlaceholders(match[0]).trim();
-			if (value) complete.push(value);
-			lastConsumed = sentencePattern.lastIndex;
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i];
+			if (!entry || entry.type !== "message") continue;
+			const message = entry.message;
+			if (!message || message.role !== "assistant") continue;
+			const rawSegments = rawMessageTextSegments(message);
+			if (rawSegments.length === 0) continue;
+			return rawSegments.join("\n\n");
 		}
 
-		const remainder = restorePlaceholders(pathsEscaped.slice(lastConsumed));
-		return { complete, remainder };
-	};
-
-	const speakTextSegments = (message: any): boolean => {
-		const segments = messageTextSegments(message);
-		if (segments.length === 0) return false;
-		for (const segment of segments) {
-			for (const chunk of allSpokenChunks(segment)) {
-				enqueueSpeech(chunk);
-			}
-		}
-		return true;
-	};
-
-	const flushStreamingRemainder = () => {
-		const cleaned = spokenFriendlyText(streamingTextBuffer);
-		streamingTextBuffer = "";
-		if (!cleaned) return;
-		for (const chunk of allSpokenChunks(cleaned)) {
-			enqueueSpeech(chunk);
-		}
+		return "";
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		streamingTextBuffer = "";
-		sawStreamingTextDelta = false;
+		lastAssistantOutput = latestAssistantOutputFromSession(ctx as any);
 		acknowledgedUserMessageInTurn = false;
 		stopStillWorkingAnnouncements();
 		startTtsControlServer(ctx as UIContext);
@@ -484,10 +385,9 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const typedCtx = ctx as UIContext;
 			enabled = !enabled;
-
 			if (enabled) {
 				setStatus(typedCtx, "loading");
-				typedCtx.ui.notify("Speak mode enabled. Loading TTS model and starting listener...", "info");
+				typedCtx.ui.notify("Speak mode enabled. Loading TTS and summarizer models, then starting listener...", "info");
 				try {
 					await startDaemon(typedCtx);
 					await startListener(typedCtx);
@@ -502,7 +402,6 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			}
-
 			stopListener(typedCtx);
 			stopDaemon(typedCtx);
 			setStatus(typedCtx, "off");
@@ -511,75 +410,70 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_start", async () => {
-		streamingTextBuffer = "";
-		sawStreamingTextDelta = false;
 		acknowledgedUserMessageInTurn = false;
-		stopStillWorkingAnnouncements();
+	});
+
+	pi.on("input", async (event, ctx) => {
+		if (!enabled) return { action: "continue" };
+		const text = event.text ?? "";
+		if (!FULL_OUTPUT_TRIGGER_PATTERN.test(text) || !WINSTON_TRIGGER_PATTERN.test(text)) return { action: "continue" };
+		const typedCtx = ctx as UIContext;
+		if (!lastAssistantOutput) {
+			lastAssistantOutput = latestAssistantOutputFromSession(ctx as any);
+		}
+		if (!lastAssistantOutput) {
+			typedCtx.ui.notify("No previous assistant output is available yet.", "warning");
+			return { action: "handled" };
+		}
+		try {
+			showFullOutputInGlimpse(lastAssistantOutput, typedCtx);
+		} catch (error: any) {
+			typedCtx.ui.notify(`Failed to open Glimpse window: ${error?.message ?? String(error)}`, "error");
+		}
+		return { action: "handled" };
 	});
 
 	pi.on("message_start", async (event) => {
 		const message = (event as any).message;
 		if (!message) return;
-
-		if (message.role === "user") {
-			if (enabled) {
-				interruptPlayback();
-				if (!acknowledgedUserMessageInTurn) {
-					enqueueSpeech("Message received. Working...");
-					acknowledgedUserMessageInTurn = true;
-				}
-				startStillWorkingAnnouncements();
-			}
-			return;
-		}
-
-		if (message.role !== "assistant") return;
-		streamingTextBuffer = "";
-		sawStreamingTextDelta = false;
-	});
-
-	pi.on("message_update", async (event) => {
+		if (message.role !== "user") return;
 		if (!enabled) return;
-		const assistantMessageEvent = (event as any).assistantMessageEvent;
-		if (!assistantMessageEvent || assistantMessageEvent.type !== "text_delta") return;
-		if (typeof assistantMessageEvent.delta !== "string" || !assistantMessageEvent.delta) return;
-
-		if (!sawStreamingTextDelta) {
-			stopStillWorkingAnnouncements();
+		interruptPlayback();
+		if (!acknowledgedUserMessageInTurn) {
+			enqueueSpeech("Message received. Working...");
+			acknowledgedUserMessageInTurn = true;
 		}
-		sawStreamingTextDelta = true;
-		streamingTextBuffer += assistantMessageEvent.delta;
-		const { complete, remainder } = extractCompleteSentences(streamingTextBuffer);
-		streamingTextBuffer = remainder;
-
-		for (const sentence of complete) {
-			const cleaned = spokenFriendlyText(sentence);
-			if (!cleaned) continue;
-			for (const chunk of allSpokenChunks(cleaned)) {
-				enqueueSpeech(chunk);
-			}
-		}
+		startStillWorkingAnnouncements();
 	});
 
 	pi.on("message_end", async (event) => {
-		if (!enabled) return;
 		const message = (event as any).message;
 		if (!message || message.role !== "assistant") return;
 
-		stopStillWorkingAnnouncements();
-		flushStreamingRemainder();
-		if (!sawStreamingTextDelta) {
-			speakTextSegments(message);
+		const rawSegments = rawMessageTextSegments(message);
+		if (rawSegments.length > 0) {
+			lastAssistantOutput = rawSegments.join("\n\n");
 		}
 
-		streamingTextBuffer = "";
-		sawStreamingTextDelta = false;
+		if (!enabled) return;
+		const segments = messageTextSegments(message);
+		if (segments.length === 0) return;
+		enqueueSummarizedSpeech(segments.join("\n\n"));
+	});
+
+	pi.on("turn_end", async (event) => {
+		if (!enabled) return;
+		const turnEvent = event as any;
+		const message = turnEvent?.message;
+		const toolResults = Array.isArray(turnEvent?.toolResults) ? turnEvent.toolResults : [];
+		if (!message || message.role !== "assistant") return;
+		if (toolResults.length > 0) return;
+		stopStillWorkingAnnouncements();
 	});
 
 	pi.on("session_shutdown", async () => {
 		enabled = false;
-		streamingTextBuffer = "";
-		sawStreamingTextDelta = false;
+		lastAssistantOutput = "";
 		acknowledgedUserMessageInTurn = false;
 		stopTtsControlServer();
 		stopListener(null);

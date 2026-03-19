@@ -2,6 +2,7 @@
 __pycache__/
 extensions/__pycache__/
 
+.DS_Store
 listener/.build/
 listener/captures/*.wav
 listener/captures/*.txt

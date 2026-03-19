@@ -1,5 +1,6 @@
-torch
+transformers
 numpy
 sounddevice
 soundfile
 mlx-audio==0.4.1
+mlx-lm
