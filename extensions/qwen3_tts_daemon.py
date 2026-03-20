@@ -207,12 +207,7 @@ def split_into_tts_chunks(text: str) -> list[str]:
     if not sentences:
         return [normalized]
 
-    chunks: list[str] = []
-    for i in range(0, len(sentences), 2):
-        chunk = " ".join(sentences[i : i + 2]).strip()
-        if chunk:
-            chunks.append(chunk)
-    return chunks
+    return sentences
 
 
 def main() -> None:
