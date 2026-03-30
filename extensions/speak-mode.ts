@@ -15,8 +15,10 @@ const PROJECT_ROOT = path.resolve(EXTENSION_DIR, "..");
 const PYTHON_EXECUTABLE = path.join(PROJECT_ROOT, ".venv/bin/python");
 const LISTENER_PACKAGE_PATH = path.join(PROJECT_ROOT, "listener");
 const TTS_CONTROL_SOCKET_PATH = path.join(os.tmpdir(), "pi-tts-control.sock");
-const GLIMPSE_MODULE_PATH = "/Users/aust/src/glimpse/src/glimpse.mjs";
+const GLIMPSE_MODULE_PATH = path.resolve(PROJECT_ROOT, "../glimpse/src/glimpse.mjs");
 const FULL_OUTPUT_TRIGGER_PATTERN = /\bfull output\b/i;
+const SUMMARY_TRIGGER_PATTERN = /\bsummary\b/i;
+const TTS_TRIGGER_PATTERN = /\btts\b/i;
 const WINSTON_TRIGGER_PATTERN = /\bwinston\b/i;
 
 type UIContext = {
@@ -36,6 +38,8 @@ export default function (pi: ExtensionAPI) {
 	let listenerStartupPromise: Promise<void> | null = null;
 	let pendingPayloads: string[] = [];
 	let lastAssistantOutput = "";
+	let lastTtsSummaryOutput = "";
+	let lastUserMessage = "";
 	let acknowledgedUserMessageInTurn = false;
 	let stillWorkingInterval: NodeJS.Timeout | null = null;
 
@@ -58,7 +62,11 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(`${prefix}: ${output}`, "error");
 	};
 
-	const showFullOutputInGlimpse = (text: string, ctx: UIContext) => {
+	const showTextInGlimpse = (text: string, options: { title: string; header: string; openedMessage: string }, ctx: UIContext) => {
+		if (!fs.existsSync(GLIMPSE_MODULE_PATH)) {
+			throw new Error(`Glimpse module not found at ${GLIMPSE_MODULE_PATH}`);
+		}
+
 		const script = `
 import { prompt } from ${JSON.stringify(GLIMPSE_MODULE_PATH)};
 
@@ -77,11 +85,11 @@ const escapeHtml = (value) => value
 
 const escaped = escapeHtml(text);
 const html = \`<body style="margin:0;background:#111;color:#e5e7eb;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">
-	<div style="padding:14px 16px;border-bottom:1px solid #2f2f2f;font-family:system-ui, -apple-system, sans-serif;font-size:13px;color:#a3a3a3;">Last full assistant output</div>
+	<div style="padding:14px 16px;border-bottom:1px solid #2f2f2f;font-family:system-ui, -apple-system, sans-serif;font-size:13px;color:#a3a3a3;">${options.header}</div>
 	<pre style="margin:0;padding:16px;white-space:pre-wrap;word-break:break-word;line-height:1.45;font-size:13px;">\${escaped}</pre>
 </body>\`;
 
-await prompt(html, { width: 980, height: 720, title: "Full Output" });
+await prompt(html, { width: 980, height: 720, title: ${JSON.stringify(options.title)} });
 `;
 
 		const child = spawn("node", ["--input-type=module", "-e", script], {
@@ -92,10 +100,10 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 		child.stdin.write(text);
 		child.stdin.end();
 		child.unref();
-		ctx.ui.notify("Opened full output in Glimpse.", "info");
+		ctx.ui.notify(options.openedMessage, "info");
 	};
 
-	const enqueuePayload = (payload: { type: "speak" | "summarize_speak"; text: string }) => {
+	const enqueuePayload = (payload: { type: "speak" | "summarize_speak"; text: string; userMessage?: string }) => {
 		if (!enabled) return;
 		const serialized = JSON.stringify(payload);
 		if (!daemon || !daemonReady) {
@@ -111,10 +119,11 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 		enqueuePayload({ type: "speak", text: line });
 	};
 
-	const enqueueSummarizedSpeech = (text: string) => {
+	const enqueueSummarizedSpeech = (text: string, userMessage: string) => {
 		const cleaned = text.replace(/[\p{Extended_Pictographic}\uFE0F]/gu, "").replace(/\s+/g, " ").trim();
 		if (!cleaned) return;
-		enqueuePayload({ type: "summarize_speak", text: cleaned });
+		const cleanedUserMessage = userMessage.replace(/[\p{Extended_Pictographic}\uFE0F]/gu, "").replace(/\s+/g, " ").trim();
+		enqueuePayload({ type: "summarize_speak", text: cleaned, userMessage: cleanedUserMessage || undefined });
 	};
 
 	const flushPending = () => {
@@ -274,14 +283,37 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 				reject(new Error(err ? `Timed out waiting for TTS+summarizer models to load: ${err}` : "Timed out waiting for TTS+summarizer models to load."));
 			}, DAEMON_READY_TIMEOUT_MS);
 
+			let stdoutBuffer = "";
 			child.stdout.setEncoding("utf8");
 			child.stdout.on("data", (chunk: string) => {
-				if (!daemonReady && chunk.includes("READY")) {
-					clearTimeout(timeout);
-					daemonReady = true;
-					startupPromise = null;
-					flushPending();
-					resolve();
+				stdoutBuffer += chunk;
+				while (true) {
+					const newline = stdoutBuffer.indexOf("\n");
+					if (newline === -1) break;
+					const line = stdoutBuffer.slice(0, newline).trim();
+					stdoutBuffer = stdoutBuffer.slice(newline + 1);
+					if (!line) continue;
+
+					if (line === "READY") {
+						if (!daemonReady) {
+							clearTimeout(timeout);
+							daemonReady = true;
+							startupPromise = null;
+							flushPending();
+							resolve();
+						}
+						continue;
+					}
+
+					if (line.startsWith("SUMMARY_JSON:")) {
+						const payload = line.slice("SUMMARY_JSON:".length);
+						try {
+							const parsed = JSON.parse(payload);
+							if (parsed && typeof parsed.text === "string") {
+								lastTtsSummaryOutput = parsed.text.trim();
+							}
+						} catch {}
+					}
 				}
 			});
 
@@ -338,8 +370,13 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 			.trim();
 	};
 
-	const rawMessageTextSegments = (message: any): string[] => {
-		if (!message || message.role !== "assistant") return [];
+	const rawMessageTextSegments = (message: any, role?: "assistant" | "user"): string[] => {
+		if (!message) return [];
+		if (role && message.role !== role) return [];
+		if (typeof message.content === "string") {
+			const raw = message.content.trim();
+			return raw ? [raw] : [];
+		}
 		const content = Array.isArray(message.content) ? message.content : [];
 		const segments: string[] = [];
 		for (const item of content) {
@@ -351,11 +388,11 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 	};
 
 	const messageTextSegments = (message: any): string[] => {
-		const segments = rawMessageTextSegments(message);
+		const segments = rawMessageTextSegments(message, "assistant");
 		return segments.map((segment) => spokenFriendlyText(segment)).filter((segment) => segment.length > 0);
 	};
 
-	const latestAssistantOutputFromSession = (ctx: any): string => {
+	const latestMessageOutputFromSession = (ctx: any, role: "assistant" | "user"): string => {
 		const entries = ctx?.sessionManager?.getEntries?.();
 		if (!Array.isArray(entries)) return "";
 
@@ -363,8 +400,8 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 			const entry = entries[i];
 			if (!entry || entry.type !== "message") continue;
 			const message = entry.message;
-			if (!message || message.role !== "assistant") continue;
-			const rawSegments = rawMessageTextSegments(message);
+			if (!message || message.role !== role) continue;
+			const rawSegments = rawMessageTextSegments(message, role);
 			if (rawSegments.length === 0) continue;
 			return rawSegments.join("\n\n");
 		}
@@ -373,7 +410,9 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		lastAssistantOutput = latestAssistantOutputFromSession(ctx as any);
+		lastAssistantOutput = latestMessageOutputFromSession(ctx as any, "assistant");
+		lastUserMessage = latestMessageOutputFromSession(ctx as any, "user");
+		lastTtsSummaryOutput = "";
 		acknowledgedUserMessageInTurn = false;
 		stopStillWorkingAnnouncements();
 		startTtsControlServer(ctx as UIContext);
@@ -416,27 +455,62 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 	pi.on("input", async (event, ctx) => {
 		if (!enabled) return { action: "continue" };
 		const text = event.text ?? "";
-		if (!FULL_OUTPUT_TRIGGER_PATTERN.test(text) || !WINSTON_TRIGGER_PATTERN.test(text)) return { action: "continue" };
+		if (!WINSTON_TRIGGER_PATTERN.test(text)) return { action: "continue" };
+		const wantsFullOutput = FULL_OUTPUT_TRIGGER_PATTERN.test(text);
+		const wantsSummary = SUMMARY_TRIGGER_PATTERN.test(text);
+		const wantsTts = TTS_TRIGGER_PATTERN.test(text);
+		const wantsTtsSummary = wantsSummary && wantsTts;
+		if (!wantsFullOutput && !wantsTtsSummary) return { action: "continue" };
+
 		const typedCtx = ctx as UIContext;
-		if (!lastAssistantOutput) {
-			lastAssistantOutput = latestAssistantOutputFromSession(ctx as any);
-		}
-		if (!lastAssistantOutput) {
-			typedCtx.ui.notify("No previous assistant output is available yet.", "warning");
+		if (wantsFullOutput) {
+			if (!lastAssistantOutput) {
+				lastAssistantOutput = latestMessageOutputFromSession(ctx as any, "assistant");
+			}
+			if (!lastAssistantOutput) {
+				typedCtx.ui.notify("No previous assistant output is available yet.", "warning");
+				return { action: "handled" };
+			}
+			try {
+				showTextInGlimpse(
+					lastAssistantOutput,
+					{ title: "Full Output", header: "Last full assistant output", openedMessage: "Opened full output in Glimpse." },
+					typedCtx,
+				);
+			} catch (error: any) {
+				typedCtx.ui.notify(`Failed to open Glimpse window: ${error?.message ?? String(error)}`, "error");
+			}
 			return { action: "handled" };
 		}
-		try {
-			showFullOutputInGlimpse(lastAssistantOutput, typedCtx);
-		} catch (error: any) {
-			typedCtx.ui.notify(`Failed to open Glimpse window: ${error?.message ?? String(error)}`, "error");
+
+		if (wantsTtsSummary) {
+			if (!lastTtsSummaryOutput) {
+				typedCtx.ui.notify("No TTS summary is available yet.", "warning");
+				return { action: "handled" };
+			}
+			try {
+				showTextInGlimpse(
+					lastTtsSummaryOutput,
+					{ title: "TTS Summary", header: "Last summary sent to TTS", openedMessage: "Opened TTS summary in Glimpse." },
+					typedCtx,
+				);
+			} catch (error: any) {
+				typedCtx.ui.notify(`Failed to open Glimpse window: ${error?.message ?? String(error)}`, "error");
+			}
+			return { action: "handled" };
 		}
-		return { action: "handled" };
+
+		return { action: "continue" };
 	});
 
 	pi.on("message_start", async (event) => {
 		const message = (event as any).message;
 		if (!message) return;
 		if (message.role !== "user") return;
+		const rawSegments = rawMessageTextSegments(message, "user");
+		if (rawSegments.length > 0) {
+			lastUserMessage = rawSegments.join("\n\n");
+		}
 		if (!enabled) return;
 		interruptPlayback();
 		if (!acknowledgedUserMessageInTurn) {
@@ -450,7 +524,7 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 		const message = (event as any).message;
 		if (!message || message.role !== "assistant") return;
 
-		const rawSegments = rawMessageTextSegments(message);
+		const rawSegments = rawMessageTextSegments(message, "assistant");
 		if (rawSegments.length > 0) {
 			lastAssistantOutput = rawSegments.join("\n\n");
 		}
@@ -458,7 +532,7 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 		if (!enabled) return;
 		const segments = messageTextSegments(message);
 		if (segments.length === 0) return;
-		enqueueSummarizedSpeech(segments.join("\n\n"));
+		enqueueSummarizedSpeech(segments.join("\n\n"), lastUserMessage);
 	});
 
 	pi.on("turn_end", async (event) => {
@@ -474,6 +548,8 @@ await prompt(html, { width: 980, height: 720, title: "Full Output" });
 	pi.on("session_shutdown", async () => {
 		enabled = false;
 		lastAssistantOutput = "";
+		lastTtsSummaryOutput = "";
+		lastUserMessage = "";
 		acknowledgedUserMessageInTurn = false;
 		stopTtsControlServer();
 		stopListener(null);

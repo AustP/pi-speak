@@ -21,8 +21,10 @@ REFERENCE_AUDIO_FILENAME = "winston.wav"
 STREAMING_INTERVAL_SECONDS = 0.2
 PLAYBACK_PREBUFFER_SECONDS = 0.1
 PLAYBACK_GAIN = 2.5
-SUMMARY_INPUT_MAX_CHARS = 7000
+SUMMARY_INPUT_MAX_CHARS = 10000
 SUMMARY_MAX_TOKENS = 8192
+SUMMARY_CONTEXT_MAX_CHARS = 1200
+TTS_CHUNK_MAX_CHARS = 280
 
 _SHUTTING_DOWN = False
 
@@ -116,29 +118,49 @@ def speak_text(model, text: str, reference_audio_path: str, stop_event: threadin
             playback_thread.join()
 
 
-def summarize_for_speech(tokenizer, model, text: str) -> str:
+def summarize_for_speech(tokenizer, model, text: str, user_message: str = "") -> str:
     trimmed = text.strip()
     if not trimmed:
         return ""
 
     prompt_text = trimmed[:SUMMARY_INPUT_MAX_CHARS]
+    context_text = user_message.strip()[:SUMMARY_CONTEXT_MAX_CHARS]
+
+    if context_text:
+        prompt_body = (
+            "Summarize only the assistant output into 2 to 4 short, speaker-friendly sentences for TTS playback. "
+            "Keep the important outcome and concrete next step. "
+            "Use plain spoken language with no markdown or list formatting.\n\n"
+            "User message for context only (do not summarize this unless needed to resolve references):\n"
+            f"{context_text}\n\n"
+            "Assistant output to summarize:\n"
+            f"{prompt_text}"
+        )
+    else:
+        prompt_body = (
+            "Summarize only the assistant output into 2 to 4 short, speaker-friendly sentences for TTS playback. "
+            "Keep the important outcome and concrete next step. "
+            "Use plain spoken language with no markdown or list formatting.\n\n"
+            "Assistant output to summarize:\n"
+            f"{prompt_text}"
+        )
+
     messages = [
         {
             "role": "system",
             "content": (
-                "You rewrite assistant output for a text-to-speech engine. "
+                "You summarize assistant output for a text-to-speech engine. "
+                "Your job is only to summarize the assistant output and not inject any additional ideas, instructions, or content. "
+                "If the source content is already short, keep it close to the original and only make it easier to read aloud. "
                 "Return only plain text that sounds natural when spoken aloud. "
-                "Use short, clear sentences and avoid markdown, code formatting, and symbols that are awkward to pronounce."
+                "Use short, clear sentences and avoid markdown, code formatting, and symbols that are awkward to pronounce. "
+                "Write in first person from the assistant perspective. "
+                "Winston is the assistant's name, not the user's name."
             ),
         },
         {
             "role": "user",
-            "content": (
-                "Summarize this into 2 to 4 short, speaker-friendly sentences for TTS playback. "
-                "Keep the important outcome and concrete next step. "
-                "Use plain spoken language with no markdown or list formatting.\n\n"
-                f"{prompt_text}"
-            ),
+            "content": prompt_body,
         },
     ]
 
@@ -197,17 +219,66 @@ def speakify_text(text: str) -> str:
     return "\n".join(line for line in cleaned_lines if line).strip()
 
 
-def split_into_tts_chunks(text: str) -> list[str]:
-    normalized = re.sub(r"\s+", " ", text).strip()
-    if not normalized:
+def _split_long_text_to_word_chunks(text: str, max_chars: int) -> list[str]:
+    words = text.split()
+    if not words:
         return []
 
-    sentence_like = re.findall(r"[^.!?]+[.!?]+(?:[\"')\]]+)?|[^.!?]+$", normalized)
-    sentences = [s.strip() for s in sentence_like if s.strip()]
-    if not sentences:
-        return [normalized]
+    chunks: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        chunks.append(current)
+        current = word
 
-    return sentences
+    chunks.append(current)
+    return chunks
+
+
+def split_into_tts_chunks(text: str) -> list[str]:
+    if not text or not text.strip():
+        return []
+
+    normalized_newlines = text.replace("\r\n", "\n")
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", normalized_newlines) if p.strip()]
+    if not paragraphs:
+        return []
+
+    chunks: list[str] = []
+
+    for paragraph in paragraphs:
+        single_line_paragraph = re.sub(r"[ \t\n]+", " ", paragraph).strip()
+        if not single_line_paragraph:
+            continue
+
+        sentence_like = re.findall(r"[^.!?]+[.!?]+(?:[\"')\]]+)?|[^.!?]+$", single_line_paragraph)
+        sentences = [s.strip() for s in sentence_like if s.strip()]
+        if not sentences:
+            sentences = [single_line_paragraph]
+
+        current_chunk = ""
+        for sentence in sentences:
+            sentence_parts = _split_long_text_to_word_chunks(sentence, TTS_CHUNK_MAX_CHARS)
+            for part in sentence_parts:
+                if not current_chunk:
+                    current_chunk = part
+                    continue
+
+                candidate = f"{current_chunk} {part}"
+                if len(candidate) <= TTS_CHUNK_MAX_CHARS:
+                    current_chunk = candidate
+                    continue
+
+                chunks.append(current_chunk)
+                current_chunk = part
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+    return chunks
 
 
 def main() -> None:
@@ -241,16 +312,28 @@ def main() -> None:
                 task_text = str(task.get("text", "")).strip()
                 if not task_text:
                     continue
+                task_user_message = str(task.get("userMessage", "")).strip()
 
                 text_to_speak = task_text
                 if task_type == "summarize_speak":
-                    text_to_speak = summarize_for_speech(summarize_tokenizer, summarize_model, task_text)
+                    text_to_speak = summarize_for_speech(
+                        summarize_tokenizer,
+                        summarize_model,
+                        task_text,
+                        user_message=task_user_message,
+                    )
                     if not text_to_speak:
                         continue
 
                 spoken_text = speakify_text(text_to_speak)
                 if not spoken_text:
                     continue
+
+                if task_type == "summarize_speak":
+                    print(
+                        f"SUMMARY_JSON:{json.dumps({'text': spoken_text}, ensure_ascii=False)}",
+                        flush=True,
+                    )
 
                 chunks = split_into_tts_chunks(spoken_text)
                 for chunk in chunks:
@@ -304,7 +387,11 @@ def main() -> None:
         if not trimmed:
             continue
 
-        speak_queue.put({"type": message_type, "text": trimmed})
+        user_message = message.get("userMessage")
+        if not isinstance(user_message, str):
+            user_message = ""
+
+        speak_queue.put({"type": message_type, "text": trimmed, "userMessage": user_message.strip()})
 
     worker.join()
     print("BYE", flush=True)
