@@ -6,25 +6,11 @@ import threading
 
 import numpy as np
 import sounddevice as sd
-from transformers import AutoTokenizer
-
 from mlx_audio.tts.utils import load_model
 
 MODEL_PATH = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
 STREAMING_INTERVAL_SECONDS = 0.2
 PLAYBACK_PREBUFFER_SECONDS = 0.1
-
-_ORIGINAL_AUTO_TOKENIZER_FROM_PRETRAINED = AutoTokenizer.from_pretrained
-
-
-def _patch_tokenizer_loader() -> None:
-    def _from_pretrained_with_fixed_regex(*args, **kwargs):
-        if "fix_mistral_regex" not in kwargs:
-            kwargs["fix_mistral_regex"] = True
-
-        return _ORIGINAL_AUTO_TOKENIZER_FROM_PRETRAINED(*args, **kwargs)
-
-    AutoTokenizer.from_pretrained = _from_pretrained_with_fixed_regex
 
 
 def speak_text(model, text: str) -> None:
@@ -101,7 +87,6 @@ def main() -> None:
     parser.add_argument("text", help="Text to speak")
     args = parser.parse_args()
 
-    _patch_tokenizer_loader()
     model = load_model(MODEL_PATH)
     speak_text(model, args.text)
 
