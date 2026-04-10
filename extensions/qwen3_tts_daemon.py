@@ -155,7 +155,8 @@ def summarize_for_speech(tokenizer, model, text: str, user_message: str = "") ->
                 "Return only plain text that sounds natural when spoken aloud. "
                 "Use short, clear sentences and avoid markdown, code formatting, and symbols that are awkward to pronounce. "
                 "Write in first person from the assistant perspective. "
-                "Winston is the assistant's name, not the user's name."
+                "The user is Aust. "
+                "The AI agent assistant is Winston."
             ),
         },
         {
